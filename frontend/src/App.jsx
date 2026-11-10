@@ -1,3 +1,4 @@
+
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
@@ -34,7 +35,6 @@ function App() {
   const [isSpeaking, setIsSpeaking] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
 
-  // Remember the automatic voice preference after refreshing the page.
   const [automaticVoiceEnabled, setAutomaticVoiceEnabled] = useState(() => {
     try {
       return localStorage.getItem('paywise_automatic_voice') === 'true'
@@ -49,7 +49,9 @@ function App() {
   const previousInvoicesRef = useRef(null)
   const voiceEnabledRef = useRef(automaticVoiceEnabled)
   const voiceQueueRef = useRef([])
+  const queuedVoiceKeysRef = useRef(new Set())
   const automaticSpeakingRef = useRef(false)
+  const voiceEventCounterRef = useRef(0)
 
   // DATE HELPERS
 
@@ -57,7 +59,6 @@ function App() {
     const year = date.getFullYear()
     const month = String(date.getMonth() + 1).padStart(2, '0')
     const day = String(date.getDate()).padStart(2, '0')
-
     return `${year}-${month}-${day}`
   }
 
@@ -81,15 +82,34 @@ function App() {
 
   // AUTOMATIC VOICE QUEUE
 
-  function processAutomaticVoiceQueue() {
+  function addAutomaticVoice(text, key = null, afterSpeak = null) {
+    if (!text || !voiceEnabledRef.current) return
+
+    if (key && queuedVoiceKeysRef.current.has(key)) return
+
+    if (key) {
+      queuedVoiceKeysRef.current.add(key)
+    }
+
+    voiceQueueRef.current.push({
+      text,
+      key,
+      afterSpeak,
+    })
+
+    processAutomaticVoiceQueue()
+  }
+
+  async function processAutomaticVoiceQueue() {
     if (!voiceEnabledRef.current) return
     if (automaticSpeakingRef.current) return
     if (voiceQueueRef.current.length === 0) return
     if (!('speechSynthesis' in window)) return
 
-    const text = voiceQueueRef.current.shift()
+    const item = voiceQueueRef.current.shift()
 
-    const speech = new SpeechSynthesisUtterance(text)
+    const speech = new SpeechSynthesisUtterance(item.text)
+
     speechRef.current = speech
     automaticSpeakingRef.current = true
 
@@ -108,112 +128,163 @@ function App() {
     speech.pitch = 1
 
     speech.onstart = () => {
-      setVoiceStatus('Automatic voice: ' + text)
+      setVoiceStatus('Automatic voice: ' + item.text)
       setIsSpeaking(true)
     }
 
-    speech.onend = () => {
-      automaticSpeakingRef.current = false
+    speech.onend = async () => {
+      if (item.key) {
+        queuedVoiceKeysRef.current.delete(item.key)
+      }
+
       setIsSpeaking(false)
       speechRef.current = null
+
+      // Wait for this announcement's follow-up check
+      // before starting the next queued announcement.
+
+      try {
+        if (item.afterSpeak && voiceEnabledRef.current) {
+          await item.afterSpeak()
+        }
+      } catch (err) {
+        setVoiceStatus(
+          'Could not check the latest invoices: ' + err.message
+        )
+      }
+
+      automaticSpeakingRef.current = false
       processAutomaticVoiceQueue()
     }
 
     speech.onerror = event => {
+      if (item.key) {
+        queuedVoiceKeysRef.current.delete(item.key)
+      }
+
       automaticSpeakingRef.current = false
       setIsSpeaking(false)
       speechRef.current = null
+
       setVoiceStatus('Automatic voice error: ' + event.error)
+
       processAutomaticVoiceQueue()
     }
 
     window.speechSynthesis.speak(speech)
   }
 
-  function addAutomaticVoice(text) {
-    if (!text) return
+  // FETCH LATEST INVOICES AFTER EVENT ANNOUNCEMENT
 
-    voiceQueueRef.current.push(text)
-    processAutomaticVoiceQueue()
-  }
+  async function fetchAndAnnounceReminders(cycleId) {
+    if (!voiceEnabledRef.current) return
 
-  // PREVENT REPEATED REMINDERS
+    const response = await fetch(API_URL)
 
-  function hasAlreadySpoken(key) {
-    try {
-      return localStorage.getItem('paywise_voice_' + key) === 'yes'
-    } catch {
-      return false
+    if (!response.ok) {
+      throw new Error('Could not fetch the latest invoices.')
     }
+
+    const latestInvoices = await response.json()
+
+    setInvoices(latestInvoices)
+
+    // Do not run event detection here.
+    // This fetch is only for the pending and overdue voice check.
+
+    announcePendingAndOverdue(latestInvoices, cycleId)
   }
 
-  function markAsSpoken(key) {
-    try {
-      localStorage.setItem('paywise_voice_' + key, 'yes')
-    } catch {
-      // Voice still works if browser storage is unavailable.
-    }
-  }
+  // CHECK AND ANNOUNCE PENDING AND OVERDUE
 
-  function announceOnce(key, text) {
-    if (hasAlreadySpoken(key)) return
-
-    markAsSpoken(key)
-    addAutomaticVoice(text)
-  }
-
-  // CHECK PENDING, OVERDUE AND DUE DATE INVOICES
-
-  function checkInvoiceReminders(invoiceList) {
+  function announcePendingAndOverdue(invoiceList, cycleId) {
     if (!voiceEnabledRef.current) return
 
     const today = getLocalDateString()
     const tomorrow = getTomorrowDateString()
 
+    const pendingInvoices = []
+    const overdueInvoices = []
+
     invoiceList.forEach(invoice => {
       const status = (invoice.status || 'PENDING').toUpperCase()
+      const dueDate = String(invoice.dueDate || '')
 
       if (status === 'PAID') return
 
+      if (status === 'OVERDUE' || (dueDate && dueDate < today)) {
+        overdueInvoices.push(invoice)
+      } else {
+        pendingInvoices.push(invoice)
+      }
+    })
+
+    const sortByDueDate = (a, b) =>
+      String(a.dueDate || '').localeCompare(
+        String(b.dueDate || '')
+      )
+
+    pendingInvoices.sort(sortByDueDate)
+    overdueInvoices.sort(sortByDueDate)
+
+    // PENDING FIRST
+
+    const pendingMessages = pendingInvoices.map(invoice => {
       const customer = invoice.customerName || 'Customer'
       const amount = formatAmount(invoice.amount)
       const dueDate = String(invoice.dueDate || '')
 
-      if (status === 'OVERDUE' || (dueDate && dueDate < today)) {
-        announceOnce(
-          `overdue_${invoice.id}_${today}`,
-          `Attention! ${customer} has an overdue payment of ${amount}. Please follow up with this customer.`
-        )
-        return
-      }
+      let reminder =
+        `Payment pending. ${customer} has an unpaid invoice of ${amount}.`
 
       if (dueDate === today) {
-        announceOnce(
-          `due_today_${invoice.id}_${today}`,
+        reminder =
           `Payment reminder! Today is the due date for ${customer}. The payment amount is ${amount}.`
-        )
-        return
-      }
-
-      if (dueDate === tomorrow) {
-        announceOnce(
-          `due_tomorrow_${invoice.id}_${today}`,
+      } else if (dueDate === tomorrow) {
+        reminder =
           `Upcoming payment reminder! ${customer} has a payment of ${amount} due tomorrow.`
-        )
-        return
       }
 
-      announceOnce(
-        `pending_${invoice.id}_${today}`,
-        `Payment pending. ${customer} has an unpaid invoice of ${amount}.`
-      )
+      return {
+        text: reminder,
+        key: `pending_event_${cycleId}_${invoice.id}`,
+      }
     })
+
+    // OVERDUE SECOND
+
+    const overdueMessages = overdueInvoices.map(invoice => ({
+      text:
+        `Attention! ${invoice.customerName || 'Customer'} has an overdue payment of ${formatAmount(invoice.amount)}. Please follow up with this customer.`,
+      key: `overdue_event_${cycleId}_${invoice.id}`,
+    }))
+
+    // Add the complete follow-up sequence together.
+    // This keeps pending before overdue.
+
+    const reminders = [
+      ...pendingMessages,
+      ...overdueMessages,
+    ]
+
+    reminders.forEach(item => {
+      if (!queuedVoiceKeysRef.current.has(item.key)) {
+        queuedVoiceKeysRef.current.add(item.key)
+      }
+    })
+
+    voiceQueueRef.current.push(...reminders)
+
+    processAutomaticVoiceQueue()
   }
 
-  // DETECT PAYMENT RECEIVED
+  // DETECT NEW INVOICES AND NEW PAYMENTS
 
-  function detectPaymentChanges(newInvoices) {
+  function detectInvoiceEvents(newInvoices) {
     const previousInvoices = previousInvoicesRef.current
+
+    // FIRST LOAD:
+    // Do not announce historical paid invoices.
 
     if (previousInvoices === null) {
       previousInvoicesRef.current = newInvoices
@@ -227,23 +298,54 @@ function App() {
       ])
     )
 
-    newInvoices.forEach(invoice => {
+    const newlyAddedInvoices = newInvoices.filter(
+      invoice => !previousMap.has(String(invoice.id))
+    )
+
+    const newlyPaidInvoices = newInvoices.filter(invoice => {
       const previousInvoice = previousMap.get(String(invoice.id))
 
-      if (!previousInvoice) return
+      if (!previousInvoice) return false
 
       const oldStatus = (previousInvoice.status || '').toUpperCase()
       const newStatus = (invoice.status || '').toUpperCase()
 
-      if (oldStatus !== 'PAID' && newStatus === 'PAID') {
-        announceOnce(
-          `payment_received_${invoice.id}`,
-          `Payment received successfully! ${invoice.customerName || 'Customer'} has paid ${formatAmount(invoice.amount)}. Thank you!`
-        )
-      }
+      return oldStatus !== 'PAID' && newStatus === 'PAID'
     })
 
     previousInvoicesRef.current = newInvoices
+
+    if (!voiceEnabledRef.current) return
+
+    // PAYMENT EVENT:
+    // PAID voice first.
+    // After it finishes, fetch and announce pending and overdue.
+
+    newlyPaidInvoices.forEach(invoice => {
+      voiceEventCounterRef.current += 1
+      const cycleId = voiceEventCounterRef.current
+
+      addAutomaticVoice(
+        `Payment received successfully! ${invoice.customerName || 'Customer'} has paid ${formatAmount(invoice.amount)}. Thank you!`,
+        `payment_event_${cycleId}_${invoice.id}`,
+        () => fetchAndAnnounceReminders(cycleId)
+      )
+    })
+
+    // NEW INVOICE EVENT:
+    // New invoice voice first.
+    // After it finishes, fetch and announce pending and overdue.
+
+    newlyAddedInvoices.forEach(invoice => {
+      voiceEventCounterRef.current += 1
+      const cycleId = voiceEventCounterRef.current
+
+      addAutomaticVoice(
+        `New invoice added successfully for ${invoice.customerName || 'Customer'}. The invoice amount is ${formatAmount(invoice.amount)}.`,
+        `new_invoice_event_${cycleId}_${invoice.id}`,
+        () => fetchAndAnnounceReminders(cycleId)
+      )
+    })
   }
 
   // ENABLE AUTOMATIC VOICE
@@ -262,14 +364,24 @@ function App() {
     try {
       localStorage.setItem('paywise_automatic_voice', 'true')
     } catch {
-      // Voice remains enabled for the current session.
+      // Voice remains enabled for this session.
     }
 
     addAutomaticVoice(
       'PayWise AI automatic voice assistant is now enabled.'
     )
 
-    checkInvoiceReminders(invoices)
+    // Announce current pending and overdue invoices after enabling.
+
+    voiceEventCounterRef.current += 1
+
+    const cycleId = voiceEventCounterRef.current
+
+    addAutomaticVoice(
+      'Checking your current pending and overdue invoices.',
+      null,
+      () => fetchAndAnnounceReminders(cycleId)
+    )
   }
 
   // DISABLE AUTOMATIC VOICE
@@ -281,10 +393,11 @@ function App() {
     try {
       localStorage.setItem('paywise_automatic_voice', 'false')
     } catch {
-      // Voice remains disabled for the current session.
+      // Voice remains disabled.
     }
 
     voiceQueueRef.current = []
+    queuedVoiceKeysRef.current.clear()
     automaticSpeakingRef.current = false
 
     if ('speechSynthesis' in window) {
@@ -309,9 +422,9 @@ function App() {
 
       const data = await response.json()
 
-      detectPaymentChanges(data)
+      detectInvoiceEvents(data)
+
       setInvoices(data)
-      checkInvoiceReminders(data)
 
       if (!silent) {
         setError('')
@@ -327,7 +440,7 @@ function App() {
     }
   }
 
-  // INITIAL LOAD AND AUTOMATIC REFRESH
+  // INITIAL LOAD AND 15-SECOND REFRESH
 
   useEffect(() => {
     loadInvoices()
@@ -345,15 +458,6 @@ function App() {
     }
   }, [])
 
-  // RESTORE AUTOMATIC VOICE AFTER INVOICES LOAD
-
-  useEffect(() => {
-    if (automaticVoiceEnabled && invoices.length > 0) {
-      voiceEnabledRef.current = true
-      checkInvoiceReminders(invoices)
-    }
-  }, [invoices, automaticVoiceEnabled])
-
   // DELETE INVOICE
 
   async function handleDeleteInvoice(invoice) {
@@ -370,9 +474,7 @@ function App() {
     try {
       const response = await fetch(
         `${API_URL}/${encodeURIComponent(invoice.id)}`,
-        {
-          method: 'DELETE',
-        }
+        { method: 'DELETE' }
       )
 
       if (!response.ok) {
@@ -593,6 +695,7 @@ function App() {
     speechRef.current = null
     automaticSpeakingRef.current = false
     voiceQueueRef.current = []
+    queuedVoiceKeysRef.current.clear()
 
     setIsSpeaking(false)
     setIsPaused(false)
@@ -614,6 +717,7 @@ function App() {
 
     automaticSpeakingRef.current = false
     voiceQueueRef.current = []
+    queuedVoiceKeysRef.current.clear()
 
     const speech = new SpeechSynthesisUtterance(textToSpeak)
     speechRef.current = speech
@@ -788,9 +892,9 @@ function App() {
           <h2>Automatic Voice Payment Assistant</h2>
 
           <p>
-            PayWise AI checks your invoices every 15 seconds and
-            announces payment updates, pending payments, overdue
-            invoices and upcoming due dates.
+            PayWise AI announces new invoices and successful payments
+            first, then checks and announces all pending and overdue
+            invoices.
           </p>
 
           {!automaticVoiceEnabled ? (
